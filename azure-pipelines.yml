@@ -1,0 +1,115 @@
+# azure-pipelines.yml
+trigger:
+  - main # Trigger on pushes to the main branch
+
+pool:
+  vmImage: 'ubuntu-latest' # Or 'windows-latest' if preferred
+
+variables:
+  # Azure Service Connection Name (created in ADO, linked to your Service Principal)
+  azureServiceConnection: 'Azure-Service-Connection-Learning' # REPLACE with your ADO service connection name
+  resourceGroupName: 'rg-simple-app-prod-001' # Matches default in variables.tf
+  location: 'eastus'
+  terraformDirectory: '$(Build.SourcesDirectory)/azure-infra'
+
+  # Variables for Terraform Backend (must match backend.tf)
+  backendResourceGroupName: 'rg-tfstate'
+  backendStorageAccountName: 'sttfstate001shirish' # MATCH YOUR GLOBALLY UNIQUE NAME
+  backendContainerName: 'tfstate'
+  backendKey: 'simple-app.tfstate'
+
+  # Secure Variable for SQL Admin Password
+  # IMPORTANT: Store this as a secret variable in your Azure DevOps pipeline library
+  # Name it exactly 'sqlAdminPassword'
+  sqlAdminPassword: $(sqlAdminPassword)
+
+
+stages:
+- stage: Terraform_Apply_Infrastructure
+  displayName: 'Deploy Azure Infrastructure with Terraform'
+
+  jobs:
+  - job: Terraform_Deployment
+    displayName: 'Terraform Plan and Apply'
+
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Set Azure Subscription Context'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az account show
+          az account set --subscription "$(SubscriptionId)" # SubscriptionId is provided by the service connection
+
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform CLI'
+      inputs:
+        terraformVersion: 'latest' # Or a specific version like '1.7.5'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: '$(backendResourceGroupName)'
+        backendAzureRmStorageAccountName: '$(backendStorageAccountName)'
+        backendAzureRmContainerName: '$(backendContainerName)'
+        backendAzureRmKey: '$(backendKey)'
+        workingDirectory: '$(terraformDirectory)'
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(terraformDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: |
+          -var="resource_group_name=$(resourceGroupName)" \
+          -var="location=$(location)" \
+          -var="sql_admin_password=$(sqlAdminPassword)"
+
+    - task: TerraformTaskV4@4
+      displayName: 'Terraform Apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(terraformDirectory)'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: |
+          -var="resource_group_name=$(resourceGroupName)" \
+          -var="location=$(location)" \
+          -var="sql_admin_password=$(sqlAdminPassword)" \
+          -auto-approve # Use -auto-approve for automation, remove for manual approval in production
+        # Capture outputs to pass to subsequent stages/jobs
+        outputs: |
+          web_app_name # This name will be needed for deploying the app code
+      name: 'TerraformOutputs' # Give this task a name to reference its outputs
+
+
+- stage: Deploy_Application_Code
+  displayName: 'Deploy Simple Web App Code'
+  dependsOn: Terraform_Apply_Infrastructure # Ensure infrastructure is ready
+  condition: succeeded('Terraform_Apply_Infrastructure') # Only run if infrastructure deployment succeeded
+
+  jobs:
+  - job: Deploy_WebApp_Code
+    displayName: 'Deploy Web App'
+    pool:
+      vmImage: 'ubuntu-latest' # Or 'windows-latest' if you prefer
+
+    steps:
+    - checkout: self # Checkout your repository
+
+    # IMPORTANT: The path to your web app code
+    - task: AzureWebApp@1
+      displayName: 'Deploy Azure Web App'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        appName: $[stageDependencies.Terraform_Apply_Infrastructure.Terraform_Deployment.outputs['TerraformOutputs.web_app_name']] # Get app name from previous stage's outputs
+        package: '$(Build.SourcesDirectory)/src/webapp' # Path to your 'index.html' or application files
+        # Optional: For a real app, you might need a build step before this,
+        # and set 'deploymentMethod: zipDeploy' for better performance.
